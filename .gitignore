@@ -30,3 +30,4 @@ vendor/
 
 dist/
 .vscode/
+__debug_bin*
