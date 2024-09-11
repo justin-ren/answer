@@ -57,6 +57,7 @@ type QuestionRepo interface {
 	GetQuestionList(ctx context.Context, question *entity.Question) (questions []*entity.Question, err error)
 	GetQuestionPage(ctx context.Context, page, pageSize int, tagIDs []string, userID, orderCond string, inDays int, showHidden, showPending bool) (
 		questionList []*entity.Question, total int64, err error)
+	GetRecommendQuestionPageByTags(ctx context.Context, userID string, tagIDs, followedQuestionIDs []string, page, pageSize int) (questionList []*entity.Question, total int64, err error)
 	UpdateQuestionStatus(ctx context.Context, questionID string, status int) (err error)
 	UpdateQuestionStatusWithOutUpdateTime(ctx context.Context, question *entity.Question) (err error)
 	RecoverQuestion(ctx context.Context, questionID string) (err error)
@@ -144,6 +145,15 @@ func (qs *QuestionCommon) UpdateAnswerCount(ctx context.Context, questionID stri
 	count, err := qs.answerRepo.GetCountByQuestionID(ctx, questionID)
 	if err != nil {
 		return err
+	}
+	if count == 0 {
+		err = qs.questionRepo.UpdateLastAnswer(ctx, &entity.Question{
+			ID:           questionID,
+			LastAnswerID: "0",
+		})
+		if err != nil {
+			return err
+		}
 	}
 	return qs.questionRepo.UpdateAnswerCount(ctx, questionID, int(count))
 }

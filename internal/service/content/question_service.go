@@ -22,7 +22,7 @@ package content
 import (
 	"encoding/json"
 	"fmt"
-	answercommon "github.com/apache/incubator-answer/internal/service/answer_common"
+	"github.com/apache/incubator-answer/internal/service/event_queue"
 	"strings"
 	"time"
 
@@ -35,11 +35,13 @@ import (
 	"github.com/apache/incubator-answer/internal/entity"
 	"github.com/apache/incubator-answer/internal/schema"
 	"github.com/apache/incubator-answer/internal/service/activity"
+	"github.com/apache/incubator-answer/internal/service/activity_common"
 	"github.com/apache/incubator-answer/internal/service/activity_queue"
+	answercommon "github.com/apache/incubator-answer/internal/service/answer_common"
 	collectioncommon "github.com/apache/incubator-answer/internal/service/collection_common"
 	"github.com/apache/incubator-answer/internal/service/config"
 	"github.com/apache/incubator-answer/internal/service/export"
-	"github.com/apache/incubator-answer/internal/service/meta_common"
+	metacommon "github.com/apache/incubator-answer/internal/service/meta_common"
 	"github.com/apache/incubator-answer/internal/service/notice_queue"
 	"github.com/apache/incubator-answer/internal/service/notification"
 	"github.com/apache/incubator-answer/internal/service/permission"
@@ -48,6 +50,7 @@ import (
 	"github.com/apache/incubator-answer/internal/service/revision_common"
 	"github.com/apache/incubator-answer/internal/service/role"
 	"github.com/apache/incubator-answer/internal/service/siteinfo_common"
+	"github.com/apache/incubator-answer/internal/service/tag"
 	tagcommon "github.com/apache/incubator-answer/internal/service/tag_common"
 	usercommon "github.com/apache/incubator-answer/internal/service/user_common"
 	"github.com/apache/incubator-answer/pkg/checker"
@@ -65,9 +68,11 @@ import (
 
 // QuestionService user service
 type QuestionService struct {
+	activityRepo                     activity_common.ActivityRepo
 	questionRepo                     questioncommon.QuestionRepo
 	answerRepo                       answercommon.AnswerRepo
 	tagCommon                        *tagcommon.TagCommonService
+	tagService                       *tag.TagService
 	questioncommon                   *questioncommon.QuestionCommon
 	userCommon                       *usercommon.UserCommon
 	userRepo                         usercommon.UserRepo
@@ -84,12 +89,15 @@ type QuestionService struct {
 	newQuestionNotificationService   *notification.ExternalNotificationService
 	reviewService                    *review.ReviewService
 	configService                    *config.ConfigService
+	eventQueueService                event_queue.EventQueueService
 }
 
 func NewQuestionService(
+	activityRepo activity_common.ActivityRepo,
 	questionRepo questioncommon.QuestionRepo,
 	answerRepo answercommon.AnswerRepo,
 	tagCommon *tagcommon.TagCommonService,
+	tagService *tag.TagService,
 	questioncommon *questioncommon.QuestionCommon,
 	userCommon *usercommon.UserCommon,
 	userRepo usercommon.UserRepo,
@@ -106,11 +114,14 @@ func NewQuestionService(
 	newQuestionNotificationService *notification.ExternalNotificationService,
 	reviewService *review.ReviewService,
 	configService *config.ConfigService,
+	eventQueueService event_queue.EventQueueService,
 ) *QuestionService {
 	return &QuestionService{
+		activityRepo:                     activityRepo,
 		questionRepo:                     questionRepo,
 		answerRepo:                       answerRepo,
 		tagCommon:                        tagCommon,
+		tagService:                       tagService,
 		questioncommon:                   questioncommon,
 		userCommon:                       userCommon,
 		userRepo:                         userRepo,
@@ -127,6 +138,7 @@ func NewQuestionService(
 		newQuestionNotificationService:   newQuestionNotificationService,
 		reviewService:                    reviewService,
 		configService:                    configService,
+		eventQueueService:                eventQueueService,
 	}
 }
 
@@ -385,6 +397,8 @@ func (qs *QuestionService) AddQuestion(ctx context.Context, req *schema.Question
 		qs.externalNotificationQueueService.Send(ctx,
 			schema.CreateNewQuestionNotificationMsg(question.ID, question.Title, question.UserID, tags))
 	}
+	qs.eventQueueService.Send(ctx, schema.NewEvent(constant.EventQuestionCreate, req.UserID).TID(question.ID).
+		QID(question.ID, question.UserID))
 
 	questionInfo, err = qs.GetQuestion(ctx, question.ID, question.UserID, req.QuestionPermission)
 	return
@@ -546,6 +560,8 @@ func (qs *QuestionService) RemoveQuestion(ctx context.Context, req *schema.Remov
 		OriginalObjectID: questionInfo.ID,
 		ActivityTypeKey:  constant.ActQuestionDeleted,
 	})
+	qs.eventQueueService.Send(ctx, schema.NewEvent(constant.EventQuestionDelete, req.UserID).TID(questionInfo.ID).
+		QID(questionInfo.ID, questionInfo.UserID))
 	return nil
 }
 
@@ -937,6 +953,8 @@ func (qs *QuestionService) UpdateQuestion(ctx context.Context, req *schema.Quest
 			RevisionID:       revisionID,
 			OriginalObjectID: question.ID,
 		})
+		qs.eventQueueService.Send(ctx, schema.NewEvent(constant.EventQuestionUpdate, req.UserID).TID(question.ID).
+			QID(question.ID, question.UserID))
 	}
 
 	questionInfo, err = qs.GetQuestion(ctx, question.ID, question.UserID, req.QuestionPermission)
@@ -1345,6 +1363,47 @@ func (qs *QuestionService) GetQuestionPage(ctx context.Context, req *schema.Ques
 	if err != nil {
 		return nil, 0, err
 	}
+	return questions, total, nil
+}
+
+// GetRecommendQuestionPage retrieves recommended question page based on following tags and questions.
+func (qs *QuestionService) GetRecommendQuestionPage(ctx context.Context, req *schema.QuestionPageReq) (
+	questions []*schema.QuestionPageResp, total int64, err error) {
+	followingTagsResp, err := qs.tagService.GetFollowingTags(ctx, req.LoginUserID)
+	if err != nil {
+		return nil, 0, err
+	}
+	tagIDs := make([]string, 0, len(followingTagsResp))
+	for _, tag := range followingTagsResp {
+		tagIDs = append(tagIDs, tag.TagID)
+	}
+
+	activityType, err := qs.activityRepo.GetActivityTypeByObjectType(ctx, constant.QuestionObjectType, "follow")
+	if err != nil {
+		return nil, 0, err
+	}
+	activities, err := qs.activityRepo.GetUserActivitysByActivityType(ctx, req.LoginUserID, activityType)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	followedQuestionIDs := make([]string, 0, len(activities))
+	for _, activity := range activities {
+		if activity.Cancelled == entity.ActivityCancelled {
+			continue
+		}
+		followedQuestionIDs = append(followedQuestionIDs, activity.ObjectID)
+	}
+	questionList, total, err := qs.questionRepo.GetRecommendQuestionPageByTags(ctx, req.LoginUserID, tagIDs, followedQuestionIDs, req.Page, req.PageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	questions, err = qs.questioncommon.FormatQuestionsPage(ctx, questionList, req.LoginUserID, "frequent")
+	if err != nil {
+		return nil, 0, err
+	}
+
 	return questions, total, nil
 }
 
